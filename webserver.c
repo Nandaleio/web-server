@@ -1,11 +1,15 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -13,14 +17,92 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE          4096
-#define DEFAULT_PORT         9090
+#define BUFFER_SIZE           4096
+#define DEFAULT_PORT          9090
 #define KEEPALIVE_TIMEOUT_SEC 5
-#define POOL_SIZE            16
-#define QUEUE_CAP            256
+#define POOL_SIZE             16
+#define QUEUE_CAP             256
+#define LIVE_RELOAD_PATH      "/_live-reload"
 
 char root[1024] = ".";
 int port = DEFAULT_PORT;
+
+/* ---------- live reload ---------- */
+
+static pthread_mutex_t reload_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  reload_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t        reload_gen  = 0;
+
+static const char live_script[] =
+    "<script>new EventSource('/_live-reload').onmessage=()=>location.reload()</script>";
+
+static void add_watches(int ifd, const char *path) {
+    inotify_add_watch(ifd, path,
+        IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO);
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (e->d_type != DT_DIR) continue;
+        char sub[1024];
+        snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+        add_watches(ifd, sub);
+    }
+    closedir(d);
+}
+
+static void *watch_thread(void *arg) {
+    (void)arg;
+    int ifd = inotify_init();
+    if (ifd < 0) return NULL;
+    add_watches(ifd, root);
+
+    char buf[4096] __attribute__((aligned(8)));
+    while (1) {
+        if (read(ifd, buf, sizeof(buf)) > 0) {
+            pthread_mutex_lock(&reload_lock);
+            reload_gen++;
+            pthread_cond_broadcast(&reload_cond);
+            pthread_mutex_unlock(&reload_lock);
+        }
+    }
+    close(ifd);
+    return NULL;
+}
+
+/* SSE endpoint: occupies a worker thread until the browser disconnects */
+static void handleSSE(int sock) {
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    if (send(sock, hdr, strlen(hdr), 0) < 0) return;
+
+    uint64_t seen = reload_gen;
+    for (;;) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+
+        pthread_mutex_lock(&reload_lock);
+        while (reload_gen == seen) {
+            if (pthread_cond_timedwait(&reload_cond, &reload_lock, &ts) == ETIMEDOUT)
+                break;
+        }
+        int changed = (reload_gen != seen);
+        seen = reload_gen;
+        pthread_mutex_unlock(&reload_lock);
+
+        if (changed) {
+            if (send(sock, "data: reload\n\n", 14, 0) < 0) break;
+        } else {
+            /* heartbeat comment — detects dead connections every 2 s */
+            if (send(sock, ":\n\n", 3, 0) < 0) break;
+        }
+    }
+}
 
 /* ---------- thread pool ---------- */
 
@@ -133,6 +215,53 @@ void sendFile(int sock, const char *path, int keepalive) {
     gmtime_r(&st.st_mtime, &tm);
     strftime(timebuf, sizeof(timebuf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
 
+    const char *ext = strrchr(path, '.');
+    int is_html = ext && (!strcmp(ext, ".html") || !strcmp(ext, ".htm"));
+
+    if (is_html) {
+        /* Read into memory so we can inject the live-reload script */
+        size_t slen = sizeof(live_script) - 1;
+        char *content = malloc(st.st_size + 1);
+        if (!content) { close(fd); send404(sock, keepalive); return; }
+
+        ssize_t r = read(fd, content, st.st_size);
+        close(fd);
+        if (r < 0) { free(content); send404(sock, keepalive); return; }
+        content[r] = '\0';
+
+        char *inject = strstr(content, "</body>");
+        if (!inject) inject = strstr(content, "</html>");
+
+        size_t total = (size_t)r + slen;
+        char header[512];
+        int hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Last-Modified: %s\r\n"
+            "%s\r\n",
+            total, timebuf, conn_header(keepalive));
+
+        if (inject) {
+            size_t prefix = (size_t)(inject - content);
+            struct iovec iov[4];
+            iov[0].iov_base = header;             iov[0].iov_len = hlen;
+            iov[1].iov_base = content;            iov[1].iov_len = prefix;
+            iov[2].iov_base = (char *)live_script; iov[2].iov_len = slen;
+            iov[3].iov_base = inject;             iov[3].iov_len = (size_t)r - prefix;
+            writev(sock, iov, 4);
+        } else {
+            struct iovec iov[3];
+            iov[0].iov_base = header;             iov[0].iov_len = hlen;
+            iov[1].iov_base = content;            iov[1].iov_len = r;
+            iov[2].iov_base = (char *)live_script; iov[2].iov_len = slen;
+            writev(sock, iov, 3);
+        }
+        free(content);
+        return;
+    }
+
     char header[512];
     snprintf(header, sizeof(header),
         "HTTP/1.1 200 OK\r\n"
@@ -162,7 +291,6 @@ void sendDir(int sock, const char *path, int keepalive) {
         return;
     }
 
-    /* build body into a grow-able buffer */
     size_t cap = 16384, used = 0;
     char *body = malloc(cap);
     if (!body) { closedir(d); send404(sock, keepalive); return; }
@@ -175,7 +303,7 @@ void sendDir(int sock, const char *path, int keepalive) {
         char entry[600];
         int n = snprintf(entry, sizeof(entry),
             "<li><a href=\"%s\">%s</a></li>", ent->d_name, ent->d_name);
-        if (used + n + 1 > cap) {
+        if (used + (size_t)n + 1 > cap) {
             cap *= 2;
             char *tmp = realloc(body, cap);
             if (!tmp) break;
@@ -242,6 +370,11 @@ void *handleClient(void *arg) {
         sscanf(request, "%15s %511s", method, route);
 
         if (strcmp(method, "GET") != 0) break;
+
+        if (strcmp(route, LIVE_RELOAD_PATH) == 0) {
+            handleSSE(client);
+            break;
+        }
 
         int keepalive = !strstr(request, "Connection: close");
 
@@ -321,6 +454,10 @@ int main(int argc, char *argv[]) {
 
     printf("Serving %s\n", root);
     printf("Listening on http://localhost:%d\n", port);
+
+    pthread_t wt;
+    pthread_create(&wt, NULL, watch_thread, NULL);
+    pthread_detach(wt);
 
     pool_init();
 
