@@ -21,14 +21,34 @@ const char *mime(const char *path) {
     const char *ext = strrchr(path, '.');
 
     if (!ext) return "text/plain";
-    if (!strcmp(ext, ".html")) return "text/html";
+    if (!strcmp(ext, ".html") || !strcmp(ext, ".htm")) return "text/html";
     if (!strcmp(ext, ".css")) return "text/css";
-    if (!strcmp(ext, ".js")) return "application/javascript";
+    if (!strcmp(ext, ".js") || !strcmp(ext, ".mjs") || !strcmp(ext, ".cjs")) return "application/javascript";
+    if (!strcmp(ext, ".ts") || !strcmp(ext, ".mts") || !strcmp(ext, ".cts")) return "application/typescript";
     if (!strcmp(ext, ".png")) return "image/png";
     if (!strcmp(ext, ".jpg") || !strcmp(ext, ".jpeg")) return "image/jpeg";
     if (!strcmp(ext, ".gif")) return "image/gif";
     if (!strcmp(ext, ".svg")) return "image/svg+xml";
+    if (!strcmp(ext, ".webp")) return "image/webp";
+    if (!strcmp(ext, ".ico")) return "image/x-icon";
     if (!strcmp(ext, ".json")) return "application/json";
+    if (!strcmp(ext, ".xml")) return "application/xml";
+    if (!strcmp(ext, ".pdf")) return "application/pdf";
+    if (!strcmp(ext, ".wasm")) return "application/wasm";
+    if (!strcmp(ext, ".txt")) return "text/plain";
+    if (!strcmp(ext, ".csv")) return "text/csv";
+    if (!strcmp(ext, ".md")) return "text/markdown";
+    if (!strcmp(ext, ".woff")) return "font/woff";
+    if (!strcmp(ext, ".woff2")) return "font/woff2";
+    if (!strcmp(ext, ".ttf")) return "font/ttf";
+    if (!strcmp(ext, ".otf")) return "font/otf";
+    if (!strcmp(ext, ".mp4")) return "video/mp4";
+    if (!strcmp(ext, ".webm")) return "video/webm";
+    if (!strcmp(ext, ".mp3")) return "audio/mpeg";
+    if (!strcmp(ext, ".ogg")) return "audio/ogg";
+    if (!strcmp(ext, ".wav")) return "audio/wav";
+    if (!strcmp(ext, ".zip")) return "application/zip";
+    if (!strcmp(ext, ".gz")) return "application/gzip";
 
     return "application/octet-stream";
 }
