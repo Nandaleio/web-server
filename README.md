@@ -35,4 +35,4 @@ The goal of this project is to demonstrate how a basic web server works internal
 Compile the server using:
 
 ```bash
-gcc server.c -o webserver -pthread
+gcc webserver.c -o webserver -pthread
